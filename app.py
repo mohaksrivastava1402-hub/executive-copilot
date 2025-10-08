@@ -5,7 +5,8 @@ import streamlit as st
 
 st.set_page_config(page_title="Executive Co-Pilot", page_icon="📊", layout="wide")
 
-df = pd.read_excel("Mining_Dataset.xlsx")
+df = pd.read_excel("jl25pg108_mohak_srivastava.xlsx")
+
 df["Date"] = pd.to_datetime(df["Date"])
 df["Month"] = df["Date"].dt.to_period("M").dt.to_timestamp()
 df["Rev_per_Unit"] = df["Revenue"] / df["Units_Sold"].replace(0, np.nan)
