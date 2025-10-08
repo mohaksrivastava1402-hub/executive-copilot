@@ -1,4 +1,6 @@
-# app.py — Executive Co-Pilot (clean v2)
+# app.py — Executive Co-Pilot (robust full version)
+# Works even if your sheet has no header row, wrong sheet, or optional columns missing.
+
 import glob, os
 import numpy as np
 import pandas as pd
@@ -23,7 +25,7 @@ else:
 st.sidebar.info(f"Using file: **{EXCEL_FILE}**")
 
 # ----------------------------
-# 1) Sheet & header picker
+# 1) Choose sheet & header row
 # ----------------------------
 xls = pd.ExcelFile(EXCEL_FILE)
 sheet = st.sidebar.selectbox("Choose sheet", xls.sheet_names, index=0)
@@ -47,28 +49,44 @@ auto_header = opts[scores.index(min(scores))] if opts else 0
 header_row = st.sidebar.number_input("Header row (0 = first row)", min_value=0, max_value=50,
                                      value=auto_header, step=1)
 
+# ---- initial load & cleanup
 df_raw = load_with_header(header_row)
 df_raw = df_raw.loc[:, ~df_raw.columns.str.lower().str.startswith("unnamed")]
 df_raw = df_raw.dropna(how="all", axis=1)
 df_raw.columns = [str(c).strip() for c in df_raw.columns]
-if df_raw.shape[1] < 4:
-    st.error("Selected sheet/header doesn’t look like a data table. Try another sheet/header row.")
-    st.stop()
 
-cols = list(df_raw.columns)
+# ---- AUTO-REPAIR: if what we think are headers look like data, reload with no header and assign defaults
+def headers_look_like_data(cols):
+    num_like = 0
+    for c in list(cols)[:7]:
+        if pd.to_datetime(pd.Series([c]), errors="coerce").notna().any():
+            num_like += 1; continue
+        try:
+            float(str(c).replace(",", ""))
+            num_like += 1
+        except Exception:
+            pass
+    return num_like >= 3  # 3+ header tokens look like dates/numbers ⇒ not a real header
 
-# ----------------------------
-# 2) Filters FIRST (nice UX)
-# ----------------------------
-def uniq(series):
-    return sorted(pd.Series(series).dropna().unique().tolist())
+if headers_look_like_data(df_raw.columns):
+    tmp = pd.read_excel(EXCEL_FILE, sheet_name=sheet, header=None, engine="openpyxl")
+    tmp = tmp.dropna(how="all", axis=1)
+    expected = ["Date","Company","Region","Units_Sold","Revenue","Market_Share_%","Customer_Satisfaction_%"]
+    use_cols = list(tmp.columns[:len(expected)])
+    df_raw = tmp[use_cols].copy()
+    df_raw.columns = expected[:len(use_cols)]
 
-# We’ll map columns later; until then, show a tiny preview:
+# Preview
 with st.expander("Preview current header (first 10 rows)"):
     st.dataframe(df_raw.head(10), use_container_width=True)
 
+cols = list(df_raw.columns)
+if len(cols) < 4:
+    st.error("Selected sheet/header doesn’t look like a data table. Try another sheet/header row.")
+    st.stop()
+
 # ----------------------------
-# 3) Column mapping (in expander)
+# 2) Column mapping (inside expander)
 # ----------------------------
 def guess(colnames, names):
     low = {c.lower(): c for c in colnames}
@@ -98,7 +116,7 @@ with st.sidebar.expander("Advanced: Map columns (use only if headers look wrong)
     csat_col    = st.selectbox("CSAT % (optional)", ["<none>"] + cols,
                                index=(["<none>"]+cols).index(g["csat"]) if g["csat"] else 0)
 
-# If user didn’t open the expander, set defaults now:
+# Defaults if expander unopened
 date_col    = locals().get("date_col", "<none>")
 company_col = locals().get("company_col", g["company"] or cols[0])
 region_col  = locals().get("region_col",  g["region"]  or cols[min(1, len(cols)-1)])
@@ -107,14 +125,14 @@ rev_col     = locals().get("rev_col",     g["revenue"] or cols[min(3, len(cols)-
 share_col   = locals().get("share_col",   g["share"]   or "<none>")
 csat_col    = locals().get("csat_col",    g["csat"]    or "<none>")
 
-# Validate required mappings
+# Validate: required must be distinct
 required = [company_col, region_col, units_col, rev_col]
 if len(set(required)) != len(required):
     st.error("Two or more required dropdowns point to the **same column**. Map each to a different column.")
     st.stop()
 
 # ----------------------------
-# 4) Normalize + types
+# 3) Normalize & types (robust)
 # ----------------------------
 work = df_raw.rename(columns={
     company_col: "Company",
@@ -126,20 +144,21 @@ if date_col != "<none>":
     work = work.rename(columns={date_col: "Date"})
 if share_col != "<none>":
     work = work.rename(columns={share_col: "Market_Share_%"})
-else:
-    work["Market_Share_%"] = np.nan
 if csat_col != "<none>":
     work = work.rename(columns={csat_col: "Customer_Satisfaction_%"})
-else:
-    work["Customer_Satisfaction_%"] = np.nan
+
+# ensure optional columns exist even if not mapped
+for col in ["Market_Share_%", "Customer_Satisfaction_%"]:
+    if col not in work.columns:
+        work[col] = np.nan
 
 def to_num(s):
     return pd.to_numeric(pd.Series(s).astype(str).str.replace(",", ""), errors="coerce")
 
 if "Date" in work.columns:
     work["Date"] = pd.to_datetime(work["Date"], errors="coerce", infer_datetime_format=True)
-work["Units_Sold"] = to_num(work["Units_Sold"])
-work["Revenue"]    = to_num(work["Revenue"])
+work["Units_Sold"] = to_num(work.get("Units_Sold", np.nan))
+work["Revenue"]    = to_num(work.get("Revenue", np.nan))
 work["Market_Share_%"] = to_num(work["Market_Share_%"])
 work["Customer_Satisfaction_%"] = to_num(work["Customer_Satisfaction_%"])
 work["Rev_per_Unit"] = work["Revenue"] / work["Units_Sold"].replace(0, np.nan)
@@ -147,21 +166,21 @@ if "Date" in work.columns:
     work["Month"] = work["Date"].dt.to_period("M").dt.to_timestamp()
 
 # ----------------------------
-# 5) Filters (now using normalized columns)
+# 4) Filters (good UX)
 # ----------------------------
 st.sidebar.subheader("Filters")
-companies = uniq(work["Company"])
-regions   = uniq(work["Region"])
+def uniq(series): return sorted(pd.Series(series).dropna().unique().tolist())
+companies = uniq(work["Company"]); regions = uniq(work["Region"])
 
-sel_companies = st.sidebar.multiselect("Company", companies, default=companies)
-sel_regions   = st.sidebar.multiselect("Region", regions, default=regions)
+sel_companies = st.sidebar.multiselect("Company", companies, default=companies or [])
+sel_regions   = st.sidebar.multiselect("Region", regions,   default=regions   or [])
 
 mask = (work["Company"].isin(sel_companies) if sel_companies else True) & \
-       (work["Region"].isin(sel_regions) if sel_regions else True)
+       (work["Region"].isin(sel_regions)   if sel_regions   else True)
 f = work.loc[mask].copy()
 
 # ----------------------------
-# 6) KPIs
+# 5) KPIs
 # ----------------------------
 fmt_money = lambda x: f"₹{x:,.0f}" if pd.notnull(x) else "—"
 c1, c2, c3, c4, c5 = st.columns(5)
@@ -172,7 +191,7 @@ c4.metric("Avg CSAT %",  round(f["Customer_Satisfaction_%"].mean(), 2) if f["Cus
 c5.metric("Avg Rev/Unit", fmt_money(f["Rev_per_Unit"].mean()))
 
 # ----------------------------
-# 7) Charts (robust)
+# 6) Charts (robust)
 # ----------------------------
 a, b = st.columns(2)
 with a:
@@ -181,7 +200,6 @@ with a:
                     use_container_width=True)
 
 with b:
-    # Guarded monthly trend in long format
     if "Date" in f.columns and f["Date"].notna().any():
         mt = f.dropna(subset=["Date"]).copy()
         mt["Date"] = pd.to_datetime(mt["Date"], errors="coerce")
@@ -189,7 +207,6 @@ with b:
             Revenue=("Revenue","sum"),
             Units_Sold=("Units_Sold","sum")
         ).reset_index()
-        # keep only numeric columns that actually have data
         value_cols = [c for c in ["Revenue","Units_Sold"]
                       if pd.to_numeric(mt[c], errors="coerce").notna().any()]
         if len(value_cols) >= 1 and mt["Date"].notna().any():
@@ -226,7 +243,7 @@ with b:
         st.info("Market Share column not provided.")
 
 # ----------------------------
-# 8) Download
+# 7) Download
 # ----------------------------
 st.subheader("⬇️ Download")
 st.download_button("Download filtered CSV",
